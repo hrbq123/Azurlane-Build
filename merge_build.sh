@@ -8,6 +8,11 @@ GAME_SERVER=$1
 APK_URL=$2
 BUILD_TYPE="APK" # 默认构建类型
 
+# 补丁检查参数
+ARCHS=("arm64_v8a" "x86" "x86_64")
+JMBQ_PATH="${DOWNLOAD_DIR}/JMBQ"
+TEMP_DIR="${DOWNLOAD_DIR}/.TEMP_LATEST_ARCH"
+
 # 检查参数
 CHECK_PARAM() {
     if [ -z "${GAME_SERVER}" ]; then
@@ -90,9 +95,11 @@ DOWNLOAD_APKTOOL() {
     local OWNER="iBotPeaches"
     local REPO="Apktool"
     local FILENAME="apktool.jar"
+    local VERSION="2.12.1"
 
-    echo "正在下载Apktool..."
-    local API_RESPONSE=$(curl -s "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest")
+    echo "正在下载Apktool..." 
+    # 由于 Apktool 3.x 会出现无法反编译 AndroidManifest.xml 的情况，故修改为最后一个 2.x(2.12.1) 版本
+    local API_RESPONSE=$(curl -s "https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/v${VERSION}")
     local DOWNLOAD_LINK=$(echo "${API_RESPONSE}" | jq -r '.assets[] | select(.name | endswith(".jar")) | .browser_download_url' | head -n 1)
     if [ -z "${DOWNLOAD_LINK}" ] || [ "${DOWNLOAD_LINK}" == "null" ]; then
         echo "无法找到Apktool下载链接"
@@ -108,6 +115,117 @@ DOWNLOAD_APKTOOL() {
     fi
 }
 
+# 保存 & 替换最新版本的补丁文件
+COPY_LATEST_ARCHS() {
+    local MODE=$1
+    if [ "${MODE}" = "save" ]; then
+        rm -rf "${TEMP_DIR}" && mkdir -p "${TEMP_DIR}"
+        for ARCH in "${ARCHS[@]}"; do
+            if [ -d "${JMBQ_PATH}/${ARCH}" ] && [ "$(ls -A "${JMBQ_PATH}/${ARCH}" 2>/dev/null)" ]; then
+                cp -r "${JMBQ_PATH}/${ARCH}" "${TEMP_DIR}/"
+                echo "  -> 已从根目录成功备份最新架构: ${ARCH}"
+            fi
+        done
+        echo "✓ 最新版本补丁已成功提取到临时目录"
+    elif [ "${MODE}" = "restore" ] && [ -d "${TEMP_DIR}" ]; then
+        mkdir -p "${JMBQ_PATH}/assets/arch"
+        for ARCH in "${ARCHS[@]}"; do
+            if [ -d "${TEMP_DIR}/${ARCH}" ]; then
+                # 旧版本中补丁库文件是在 assets/arch/ 下的，在此处进行替换
+                rm -rf "${JMBQ_PATH}/assets/arch/${ARCH}"
+                cp -r "${TEMP_DIR}/${ARCH}" "${JMBQ_PATH}/assets/arch/" || return 1
+                echo "  -> 已用最新补丁替换旧版: ${ARCH}"
+            fi
+        done
+        echo "✓ 最新版本补丁已替换到旧版结构中"
+    fi
+    return 0
+}
+
+# 验证MOD补丁的结构是否正确
+VALIDATE_MOD_PATCH() {
+    [ -d "${JMBQ_PATH}" ] || { echo "错误: JMBQ目录不存在"; return 1; }
+
+    # 1. 检查 assets/arch 中是否有任意补丁库
+    local HAS_ARCH=0
+    for ARCH in "${ARCHS[@]}"; do
+        [ -d "${JMBQ_PATH}/assets/arch/${ARCH}" ] && HAS_ARCH=1
+    done
+
+    # 2. 检查是否存在 smali_classes* 文件夹（已去除纯 smali 检测）
+    local HAS_SMALI=0
+    find "${JMBQ_PATH}" -maxdepth 1 -type d -name "smali_classes*" | grep -q . && HAS_SMALI=1
+
+    echo "[补丁库(assets): $([ $HAS_ARCH -eq 1 ] && echo 'YES ✅' || echo 'NO ❌')]"
+    echo "[Smali_classes*文件夹: $([ $HAS_SMALI -eq 1 ] && echo 'YES ✅' || echo 'NO ❌')]"
+
+    # 当 HAS_ARCH 和 HAS_SMALI 都为1时，验证通过，停止回退
+    [ $HAS_ARCH -eq 1 ] && [ $HAS_SMALI -eq 1 ] && { echo "✓ MOD补丁结构完整，停止回退！"; return 0; }
+
+    echo "✗ 结构不完整（缺少关键组件），继续回退旧版本..."
+    return 1
+}
+
+# 获取Release版本列表
+GET_ALL_RELEASES() {
+    curl -s "https://api.github.com/repos/JMBQ/azurlane/releases" | jq -r '.[].tag_name' 2>/dev/null
+}
+
+# 动态获取指定版本的下载链接与匹配的临时文件名
+GET_RELEASE_DOWNLOAD_INFO() {
+    local TARGET_VERSION=$1
+    local API_RESPONSE=$(curl -s "https://api.github.com/repos/JMBQ/azurlane/releases/tags/${TARGET_VERSION}")
+    
+    local LINK=$(echo "${API_RESPONSE}" | jq -r '.assets[] | select(.name | contains(".rar")) | .browser_download_url' | head -n 1)
+    local SUFFIX="rar"
+    
+    if [ -z "${LINK}" ] || [ "${LINK}" = "null" ]; then
+        LINK=$(echo "${API_RESPONSE}" | jq -r '.assets[] | select(.name | contains(".zip")) | .browser_download_url' | head -n 1)
+        SUFFIX="zip"
+    fi
+    
+    if [ -z "${LINK}" ] || [ "${LINK}" = "null" ]; then
+        echo "null|null"
+        return 1
+    fi
+    echo "${LINK}|${SUFFIX}"
+    return 0
+}
+
+# 下载并验证指定版本的MOD补丁
+TRY_MOD_VERSION() {
+    local TARGET_VERSION=$1
+    echo -e "\n尝试下载MOD补丁版本: ${TARGET_VERSION}"
+
+    # 捕获可能出现的解析链接失败
+    local INFO
+    INFO=$(GET_RELEASE_DOWNLOAD_INFO "${TARGET_VERSION}") || { echo "解析版本 ${TARGET_VERSION} 失败，跳过该版本"; return 1; }
+    
+    local DOWNLOAD_LINK=$(echo "${INFO}" | cut -d'|' -f1)
+    local SUFFIX=$(echo "${INFO}" | cut -d'|' -f2)
+
+    [ "${DOWNLOAD_LINK}" != "null" ] && [ -n "${DOWNLOAD_LINK}" ] || { echo "无法获取 ${TARGET_VERSION} 版本的下载链接"; return 1; }
+    
+    local TRY_FILENAME="MOD_BACKUP_${TARGET_VERSION}.${SUFFIX}"
+
+    rm -rf "${JMBQ_PATH}" "${DOWNLOAD_DIR}/${TRY_FILENAME}"
+    curl -L -o "${DOWNLOAD_DIR}/${TRY_FILENAME}" "${DOWNLOAD_LINK}" || { echo "${TARGET_VERSION} 版本下载失败"; return 1; }
+
+    if command -v 7z &> /dev/null; then
+        7z x -y "${DOWNLOAD_DIR}/${TRY_FILENAME}" -o"${JMBQ_PATH}" > /dev/null 2>&1 || { echo "${TARGET_VERSION} 版本解压失败"; return 1; }
+        rm -f "${DOWNLOAD_DIR}/${TRY_FILENAME}"
+    else
+        echo "错误: 未找到7z工具，无法解压！"; return 1;
+    fi
+
+    if VALIDATE_MOD_PATCH; then
+        echo "✓ ${TARGET_VERSION} 版本验证成功！"
+        COPY_LATEST_ARCHS restore
+        return 0
+    fi
+    return 1
+}
+
 # 下载 Mod Patch 文件并解压
 DOWNLOAD_MOD_MENU() {
     local OWNER="JMBQ"
@@ -117,19 +235,20 @@ DOWNLOAD_MOD_MENU() {
     echo "正在下载MOD补丁..."
     local API_RESPONSE=$(curl -s "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest")
     local JMBQ_VERSION=$(echo "${API_RESPONSE}" | jq -r '.tag_name')
-    # 修改：查找name中含有.rar的文件，而不是直接使用第一个assets
+    local LASTEST_VERSION=$JMBQ_VERSION
+    
     local DOWNLOAD_LINK=$(echo "${API_RESPONSE}" | jq -r '.assets[] | select(.name | contains(".rar")) | .browser_download_url' | head -n 1)
 
     if [ -z "${DOWNLOAD_LINK}" ] || [ "${DOWNLOAD_LINK}" == "null" ]; then
-        # 修改：查找name中含有.zip的文件，避免后缀不一致导致的无法获取链接
-        local FILENAME="MOD_MENU.zip"
-        local DOWNLOAD_LINK=$(echo "${API_RESPONSE}" | jq -r '.assets[] | select(.name | contains(".zip")) | .browser_download_url' | head -n 1)
+        FILENAME="MOD_MENU.zip"
+        DOWNLOAD_LINK=$(echo "${API_RESPONSE}" | jq -r '.assets[] | select(.name | contains(".zip")) | .browser_download_url' | head -n 1)
         if [ -z "${DOWNLOAD_LINK}" ] || [ "${DOWNLOAD_LINK}" == "null" ]; then
             echo "无法获取MOD Patch文件下载链接"
             exit 1
         fi
     fi
 
+    rm -rf "${JMBQ_PATH}" "${DOWNLOAD_DIR}/${FILENAME}"
     curl -L -o "${DOWNLOAD_DIR}/${FILENAME}" "${DOWNLOAD_LINK}"
     if [ $? -eq 0 ]; then
         echo "补丁下载成功！文件保存至：${DOWNLOAD_DIR}/${FILENAME}"
@@ -139,7 +258,7 @@ DOWNLOAD_MOD_MENU() {
     fi
 
     if command -v 7z &> /dev/null; then
-        7z x -y "${DOWNLOAD_DIR}/${FILENAME}" -o"${DOWNLOAD_DIR}/JMBQ"
+        7z x -y "${DOWNLOAD_DIR}/${FILENAME}" -o"${JMBQ_PATH}" > /dev/null 2>&1
     else
         echo "错误: 未找到7z工具，无法解压！"
         exit 1
@@ -149,10 +268,61 @@ DOWNLOAD_MOD_MENU() {
         echo "错误: 解压 ${FILENAME} 失败！"
         exit 1
     fi
+    
     echo "JMBQ目录内容:"  
-    ls -la "${DOWNLOAD_DIR}/JMBQ" 2>/dev/null || echo "无法列出目录内容"
+    ls -la "${JMBQ_PATH}" 2>/dev/null || echo "无法列出目录内容"
 
-    echo "JMBQ_VERSION=${JMBQ_VERSION}" >> "${GITHUB_ENV}"
+    # 执行检测
+    if VALIDATE_MOD_PATCH; then
+        echo "✓ 当前最新版本 ${JMBQ_VERSION} 验证通过！"
+    else
+        echo -e "当前最新版本 ${JMBQ_VERSION} 结构不完整，正在从根目录提取最新补丁文件..."
+        COPY_LATEST_ARCHS save
+
+        # 获取Release版本列表并寻找当前最新版
+        local ALL_VERSIONS=($(GET_ALL_RELEASES))
+        local VERSION_INDEX=-1
+        for i in "${!ALL_VERSIONS[@]}"; do
+            [ "${ALL_VERSIONS[$i]}" = "${JMBQ_VERSION}" ] && { VERSION_INDEX=$i; break; }
+        done
+        [ $VERSION_INDEX -eq -1 ] && VERSION_INDEX=0
+
+        # 开始向前追溯历史版本（限制最多尝试 10 次）
+        local FOUND_VALID=0
+        local TOTAL_VERSIONS=${#ALL_VERSIONS[@]}
+        local MAX_RETRIES=10
+        
+        # 计算实际可以循环的最大上限（避免剩余版本不足10个时越界）
+        local REMAINING_VERSIONS=$((TOTAL_VERSIONS - VERSION_INDEX - 1))
+        if [ ${REMAINING_VERSIONS} -lt ${MAX_RETRIES} ]; then
+            MAX_RETRIES=${REMAINING_VERSIONS}
+        fi
+
+        echo "最新版结构不完整，开始向前追溯历史版本（上限 ${MAX_RETRIES} 次）..."
+
+        for ((retry=1; retry<=MAX_RETRIES; retry++)); do
+            local TARGET_INDEX=$((VERSION_INDEX + retry))
+            
+            # 确保索引不越界
+            if [ ${TARGET_INDEX} -ge ${TOTAL_VERSIONS} ]; then
+                break
+            fi
+            
+            local PREV_VERSION="${ALL_VERSIONS[${TARGET_INDEX}]}"
+            echo "-> [第 ${retry}/${MAX_RETRIES} 次尝试] 正在检查历史版本: ${PREV_VERSION}"
+
+            if [ -n "${PREV_VERSION}" ] && TRY_MOD_VERSION "${PREV_VERSION}"; then
+                JMBQ_VERSION="${PREV_VERSION}"
+                FOUND_VALID=1
+                break
+            fi
+        done
+
+        [ $FOUND_VALID -eq 1 ] || { echo "错误: 尝试 ${MAX_RETRIES} 个历史版本均验证失败，停止构建！"; exit 1; }
+    fi
+
+    rm -rf "${TEMP_DIR}"
+    echo "JMBQ_VERSION=${LASTEST_VERSION}" >> "${GITHUB_ENV}"
 }
 
 # 下载APK（通用函数，根据构建类型执行不同的下载逻辑）
